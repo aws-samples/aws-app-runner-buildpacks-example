@@ -1,0 +1,614 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Parameters: 
+  Builder: 
+    Type: String
+    Description: The Cloud Native Buildpacks builder to use.
+    Default: 'paketobuildpacks/builder:full'
+    AllowedValues:
+    - 'paketobuildpacks/builder:full'
+    - 'heroku/buildpacks:20'
+
+  SampleApp:
+    Type: String
+    Description: The path of the app source code in the repository.
+    Default: java-sample
+    AllowedValues:
+    - java-sample
+    - nodejs-sample
+    - go-sample
+    - dotnet-sample
+
+Resources:
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    DependsOn: S3Seed
+    Properties: 
+      RepositoryName: !Sub '${AWS::StackName}-repository'
+      Code:
+        BranchName: main
+        S3: 
+          Bucket: !Ref CodePipelineArtifactStoreBucket
+          Key: src.zip
+
+  ImageRepository: 
+    Type: AWS::ECR::Repository
+
+  CodePipelineArtifactStoreBucket:
+    Type: 'AWS::S3::Bucket'
+
+  CodePipelineArtifactStoreBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref CodePipelineArtifactStoreBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Sid: DenyUnEncryptedObjectUploads
+          Effect: Deny
+          Principal: '*'
+          Action: 's3:PutObject'
+          Resource: !Sub '${CodePipelineArtifactStoreBucket.Arn}/*'
+          Condition:
+            StringNotEquals:
+              's3:x-amz-server-side-encryption': 'aws:kms'
+        - Sid: DenyInsecureConnections
+          Effect: Deny
+          Principal: '*'
+          Action: 's3:*'
+          Resource: !Sub '${CodePipelineArtifactStoreBucket.Arn}/*'
+          Condition:
+            Bool:
+              'aws:SecureTransport': false
+
+  AmazonCloudWatchEventRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - events.amazonaws.com
+          Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+      - PolicyName: cwe-pipeline-execution
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action: 'codepipeline:StartPipelineExecution'
+            Resource: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AppPipeline}'
+
+  AmazonCloudWatchEventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      EventPattern:
+        source:
+        - aws.codecommit
+        detail-type:
+        - CodeCommit Repository State Change
+        resources:
+        - !GetAtt CodeCommitRepository.Arn
+        detail:
+          event:
+          - referenceCreated
+          - referenceUpdated
+          referenceType:
+          - branch
+          referenceName:
+          - main
+      Targets:
+      - Arn: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AppPipeline}'
+        RoleArn: !GetAtt AmazonCloudWatchEventRole.Arn
+        Id: codepipeline-AppPipeline
+
+  AppPipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+          - Name: SourceAction
+            ActionTypeId:
+              Category: Source
+              Owner: AWS
+              Version: '1'
+              Provider: CodeCommit
+            OutputArtifacts:
+            - Name: Source
+            Configuration:
+              BranchName: main
+              RepositoryName: !GetAtt CodeCommitRepository.Name
+              PollForSourceChanges: false
+            RunOrder: 1
+        - Name: Build
+          Actions:
+          - Name: BuildContainerImage
+            ActionTypeId:
+              Category: Build
+              Owner: AWS
+              Version: '1'
+              Provider: CodeBuild
+            InputArtifacts:
+            - Name: Source
+            Namespace: ImageBuild
+            Configuration:
+              ProjectName: !Ref BuildCodeBuildProject
+              EnvironmentVariables: !Sub |
+                [{
+                  "name": "application_name",
+                  "type": "PLAINTEXT",
+                  "value": "${ImageRepository}"
+                },{
+                  "name": "app_path",
+                  "type": "PLAINTEXT",
+                  "value": "${SampleApp}"
+                },{
+                  "name": "builder",
+                  "type": "PLAINTEXT",
+                  "value": "${Builder}"
+                }]
+            RunOrder: 1
+          - Name: PrepareCloudFormation
+            ActionTypeId:
+              Category: Build
+              Owner: AWS
+              Version: '1'
+              Provider: CodeBuild
+            InputArtifacts:
+            - Name: Source
+            OutputArtifacts:
+            - Name: Prepare
+            Configuration:
+              ProjectName: !Ref PrepareCodeBuildProject
+              EnvironmentVariables: !Sub |
+                [{
+                  "name": "image_tag",
+                  "type": "PLAINTEXT",
+                  "value": "#{ImageBuild.IMAGE_TAG}"
+                }]
+            RunOrder: 2
+        - Name: AppRunnerDeploy
+          Actions:
+          - Name: Deploy
+            ActionTypeId:
+              Category: Deploy
+              Owner: AWS
+              Version: '1'
+              Provider: CloudFormation
+            InputArtifacts:
+            - Name: Prepare
+            Configuration:
+              ActionMode: REPLACE_ON_FAILURE
+              RoleArn: !GetAtt CloudFormationDeployActionRole.Arn
+              StackName: !Sub '${AWS::StackName}-service'
+              TemplatePath: Prepare::cloudformation.yml
+            RunOrder: 1
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineArtifactStoreBucket
+
+  CodePipelineServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - codepipeline.amazonaws.com
+          Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+      - PolicyName: AWS-CodePipeline
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'codecommit:CancelUploadArchive'
+            - 'codecommit:GetBranch'
+            - 'codecommit:GetCommit'
+            - 'codecommit:GetUploadArchiveStatus'
+            - 'codecommit:UploadArchive'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - 'codebuild:BatchGetBuilds'
+            - 'codebuild:StartBuild'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - 'lambda:InvokeFunction'
+            - 'lambda:ListFunctions'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - 'iam:PassRole'
+            Resource: 
+            - !GetAtt CodeBuildRole.Arn
+            - !GetAtt CloudFormationDeployActionRole.Arn
+          - Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Effect: Allow
+            Resource: !Sub ${CodePipelineArtifactStoreBucket.Arn}/* 
+          - Action:
+              - s3:GetBucketVersioning
+            Resource: !Sub ${CodePipelineArtifactStoreBucket.Arn}
+            Effect: Allow
+          - Effect: Allow
+            Action:
+            - cloudformation:GetTemplate
+            - cloudformation:DescribeStackResource
+            - cloudformation:DescribeStackResources
+            - cloudformation:DescribeStackEvents
+            - cloudformation:DescribeStacks
+            - cloudformation:DescribeStackSet
+            - cloudformation:DescribeStackSetOperation
+            - cloudformation:DeleteStack
+            - cloudformation:UpdateStack
+            - cloudformation:UpdateStackSet
+            - cloudformation:CreateStack
+            - cloudformation:CreateStackSet
+            - cloudformation:CreateStackInstances
+            - cloudformation:ListStackInstances
+            Resource: '*'
+
+  BuildCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+        ImagePullCredentialsType: CODEBUILD
+        EnvironmentVariables:
+        - Name: AWS_ACCOUNT_ID
+          Type: PLAINTEXT
+          Value: !Ref AWS::AccountId
+      ServiceRole: !Ref CodeBuildRole
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref CodeBuildLogGroup
+          Status: ENABLED
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          env:
+            variables:
+              builder: ""
+              application_name: ""
+              pack_version: "0.25.0"
+              app_path: "nil"
+            exported-variables:
+            # Exported the image tag to be used later in the CodePipeline
+            - IMAGE_TAG
+
+          phases:
+            install:
+              commands:
+              # Download the pack linux binary
+              - wget -q https://github.com/buildpacks/pack/releases/download/v$pack_version/pack-v$pack_version-linux.tgz -O - | tar -xz
+              - chmod +x ./pack
+            pre_build:
+              commands:
+              # Log in to ECR
+              - ECR_DOMAIN="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
+              - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_DOMAIN
+              # Set up some derived values for subsequent phases
+              - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+              - ECR_REPOSITORY="$ECR_DOMAIN/$application_name"
+              - IMAGE_TAG="$ECR_REPOSITORY:$COMMIT_HASH-$CODEBUILD_BUILD_NUMBER"
+            build:
+              commands:
+              - |
+                ./pack build --no-color --builder $builder \
+                --cache-image $ECR_REPOSITORY:${app_path}-cache \
+                --tag $IMAGE_TAG $ECR_REPOSITORY:latest \
+                -p ${app_path} \
+                --publish
+
+  PrepareCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+        ImagePullCredentialsType: CODEBUILD
+      ServiceRole: !Ref CodeBuildRole
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref CodeBuildLogGroup
+          Status: ENABLED
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            build:
+              commands:
+              - |
+                cat << EOF > cloudformation.yml
+                Resources:
+                  AppRunnerService:
+                    Type: AWS::AppRunner::Service
+                    Properties:
+                      ServiceName: ${AWS::StackName}-service
+                      SourceConfiguration:
+                        AuthenticationConfiguration:
+                          AccessRoleArn: "${AppRunnerEcrRole.Arn}"
+                        AutoDeploymentsEnabled: false
+                        ImageRepository:
+                          ImageIdentifier: "$image_tag"
+                          ImageRepositoryType: ECR
+                          ImageConfiguration:
+                            Port: 8080
+                            RuntimeEnvironmentVariables:
+                            - Name: PORT
+                              Value: '8080'
+                      InstanceConfiguration:
+                        Cpu: 1024
+                        Memory: 2048
+                EOF
+          artifacts:
+            files:
+            - cloudformation.yml
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: AWS-CodeBuild
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Resource:
+            - !GetAtt CodeBuildLogGroup.Arn
+            - !Sub '${CodeBuildLogGroup.Arn}:*'
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          - Effect: Allow
+            Resource:
+            - !Sub '${CodePipelineArtifactStoreBucket.Arn}/*'
+            Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:GetObjectVersion
+            - s3:GetBucketAcl
+            - s3:GetBucketLocation
+          - Action:
+            - ecr:GetAuthorizationToken
+            Resource: '*'
+            Effect: Allow
+          - Action:
+            - ecr:BatchCheckLayerAvailability
+            - ecr:CompleteLayerUpload
+            - ecr:InitiateLayerUpload
+            - ecr:PutImage
+            - ecr:UploadLayerPart
+            - ecr:GetDownloadUrlForLayer
+            - ecr:BatchGetImage
+            Resource: !Sub "${ImageRepository.Arn}"
+            Effect: Allow
+
+  CloudFormationDeployActionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service:
+            - cloudformation.amazonaws.com
+            - codebuild.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CloudFormationRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - apprunner:DescribeService
+                  - apprunner:CreateService
+                  - apprunner:UpdateService
+                  - apprunner:DeleteService
+                Effect: Allow
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                - 'iam:PassRole'
+                Resource: 
+                - !GetAtt AppRunnerEcrRole.Arn
+
+  AppRunnerEcrRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: build.apprunner.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: ECR
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Action:
+            - ecr:GetAuthorizationToken
+            Resource: '*'
+            Effect: Allow
+          - Action:
+            - ecr:BatchCheckLayerAvailability
+            - ecr:DescribeImages
+            - ecr:GetDownloadUrlForLayer
+            - ecr:BatchGetImage
+            Resource: !Sub "${ImageRepository.Arn}"
+            Effect: Allow
+
+  CodeBuildLogGroup: 
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 7
+
+  S3Seed:
+    Type: Custom::S3Seed
+    Properties:
+      ServiceToken: !GetAtt S3SeedFunction.Arn
+      Region: !Ref AWS::Region
+
+  S3SeedFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          import logging
+          import boto3
+          from botocore.vendored import requests
+          import cfnresponse
+          import shutil
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          github_org = 'aws-samples'
+          github_repo = 'aws-app-runner-buildpacks-example'
+          github_ref = 'main'
+
+          def handler(event, context):
+            logger.info('got event {}'.format(event))
+            responseData = {}
+
+            try:
+              if event['RequestType'] == 'Delete':
+                s3_client = boto3.client('s3')
+                s3_client.delete_object(
+                    Bucket='${CodePipelineArtifactStoreBucket}',
+                    Key='src.zip',
+                )
+              else:
+                url = 'https://github.com/{}/{}/archive/{}.zip'.format(github_org, github_repo, github_ref)
+                logger.info('Fetching repository zip {}...'.format(url))
+                r = requests.get(url)
+
+                with open('/tmp/src.zip', 'wb') as f:
+                  f.write(r.content)
+
+                logger.info('Unpacking archive...')
+                shutil.unpack_archive('/tmp/src.zip', '/tmp/archive')
+
+                # Prune out large samples
+                #shutil.rmtree('/tmp/archive/samples-3cc48e6325d402534dcaf26e35f38ceda92d8076/java/jar')
+                #shutil.rmtree('/tmp/archive/samples-3cc48e6325d402534dcaf26e35f38ceda92d8076/procfile')
+
+                archive_dir = '/tmp/archive/{}-{}'.format(github_repo, github_ref)
+                logger.info('Zipping archive directory {}...'.format(archive_dir))
+                shutil.make_archive('/tmp/upload', 'zip', archive_dir)
+
+                logger.info('Generated archive of size {}'.format(os.path.getsize('/tmp/upload.zip')))
+
+                logger.info('Uploading archive to S3...')
+                s3 = boto3.resource('s3')
+                s3.meta.client.upload_file('/tmp/upload.zip', '${CodePipelineArtifactStoreBucket}', 'src.zip', ExtraArgs={'ServerSideEncryption':'aws:kms',
+                    'SSEKMSKeyId':'alias/aws/s3'})
+                            
+              logger.info('responseData {}'.format(responseData))
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "SeedCode")
+            except:
+              logger.error('responseData {}'.format(responseData))
+              cfnresponse.send(event, context, cfnresponse.FAILED, responseData, "SeedCode")
+
+      Handler: 'index.handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: 'python3.7'
+      Timeout: 60
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Resource:
+            - !Sub '${CodePipelineArtifactStoreBucket.Arn}/*'
+            Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:GetObjectVersion
+            - s3:GetBucketAcl
+            - s3:GetBucketLocation
+            - s3:DeleteObject
+
+Outputs:
+  CodeCommitRepository:
+    Value: !GetAtt CodeCommitRepository.Name
+
+  CodePipeline:
+    Value: !Ref AppPipeline
+
+  EcrRepository:
+    Value: !Ref ImageRepository
+
+  PipelineS3Bucket:
+    Value: !Ref CodePipelineArtifactStoreBucket
